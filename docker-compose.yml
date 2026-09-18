@@ -1,0 +1,11 @@
+services:
+  cookie-jar:
+    build: .
+    image: cookie-jar-lab:latest
+    container_name: cookie-jar-lab
+    ports:
+      # 宿主机端口:容器端口；如想换宿主机端口，改左侧即可，例如 "3001:3000"
+      - "3000:3000"
+    environment:
+      - PORT=3000
+    restart: unless-stopped

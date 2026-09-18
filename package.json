@@ -1,0 +1,24 @@
+{
+  "name": "cookie-jar-lab",
+  "version": "1.0.0",
+  "description": "HTTP Cookie 罐演算 Web 工具：按顺序提交响应 URL 与单条 Set-Cookie，演算请求时的 Cookie 头",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:e2e": "bash test-e2e.sh"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "tldts": "^7.4.13"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.30",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

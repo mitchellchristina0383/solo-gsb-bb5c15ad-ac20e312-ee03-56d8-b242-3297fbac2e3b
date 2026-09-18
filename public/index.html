@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cookie 罐演算 · Cookie Jar Lab</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%AA%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <h1>🍪 Cookie 罐演算 <span class="sub">Cookie Jar Lab</span></h1>
+      <p class="tagline">按顺序提交「响应 URL + 单条 Set-Cookie」，演算请求时浏览器会发送哪些 Cookie（对齐 RFC 6265，含 SameSite 站点演算）</p>
+    </div>
+  </header>
+
+  <main class="wrap layout">
+    <!-- 左列：写入与发送 -->
+    <div class="col-main">
+      <section class="card" id="store-card">
+        <h2><span class="step">1</span> 写入 Set-Cookie（按顺序，一次一条）</h2>
+
+        <label class="field">
+          <span class="field-label">响应 URL（cookie 来源页面）</span>
+          <input id="store-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://shop.example.com/admin/dashboard?tab=1" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">单条 Set-Cookie（不含 <code>Set-Cookie:</code> 前缀）</span>
+          <input id="store-cookie" type="text" spellcheck="false" autocomplete="off"
+            placeholder='例如：session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure' />
+        </label>
+
+        <div class="row">
+          <button id="store-btn" class="btn primary">入罐</button>
+          <button id="fill-demo" class="btn ghost" type="button">填入示例</button>
+        </div>
+
+        <div id="store-result" class="result-box hidden"></div>
+      </section>
+
+      <section class="card" id="send-card">
+        <h2><span class="step">2</span> 发起请求，演算 Cookie 头</h2>
+
+        <label class="field">
+          <span class="field-label">请求 URL</span>
+          <input id="send-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://api.shop.example.com/orders/123/detail" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">顶层页面 URL（SameSite 站点判定的基准；留空 = 与请求 URL 同站）</span>
+          <input id="send-top-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://shop.example.com/cart（跨站可填 https://other.org/）" />
+        </label>
+
+        <div class="field-row">
+          <label class="field field-method">
+            <span class="field-label">请求方法</span>
+            <select id="send-method">
+              <option selected>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>DELETE</option>
+              <option>PATCH</option>
+              <option>HEAD</option>
+              <option>OPTIONS</option>
+            </select>
+          </label>
+          <label class="field field-nav">
+            <input id="send-topnav" type="checkbox" checked />
+            <span>顶层导航（地址栏 / 链接跳转；子资源、iframe、fetch 请取消勾选）</span>
+          </label>
+        </div>
+
+        <div class="row">
+          <button id="send-btn" class="btn primary">生成 Cookie 头</button>
+        </div>
+
+        <div id="send-result" class="result-box hidden"></div>
+      </section>
+    </div>
+
+    <!-- 右列：罐子 -->
+    <aside class="col-side">
+      <section class="card jar-card">
+        <div class="jar-head">
+          <h2>🫙 当前 Cookie 罐</h2>
+          <button id="reset-btn" class="btn danger small">重置</button>
+        </div>
+        <p class="jar-count"><span id="jar-count-num">0</span> 条（内存存储，重置或重启即清空）</p>
+        <div id="jar-table-wrap">
+          <p class="empty-hint" id="jar-empty">罐子是空的，先在左侧写入一条 Set-Cookie。</p>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="wrap rules-note">
+    <details>
+      <summary>演算规则说明（点击展开）</summary>
+      <ul>
+        <li><strong>Domain：</strong>无 Domain 属性为 host-only，仅匹配原主机；带 Domain 时匹配该域及所有子域。Domain 不是响应主机本身或其上级域时<strong>拒绝入罐</strong>；IP 主机不做子域匹配。</li>
+        <li><strong>Path：</strong>缺省取响应 URL 最后一个斜杠前的目录（如 <code>/admin/dashboard</code> → <code>/admin</code>）。匹配要求路径相等、或以 cookie-path 开头且边界是 <code>/</code>。</li>
+        <li><strong>Max-Age：</strong>正整数为相对有效期秒数；<code>Max-Age=0</code> 或负数会删除同名同域同路径项；非法值忽略（按会话 cookie）。Expires 属性不参与本演算。</li>
+        <li><strong>Secure：</strong>仅在 https 请求中发送；明文 http 响应中设置 Secure 会给出提示。</li>
+        <li><strong>SameSite：</strong>解析 <code>Strict / Lax / None</code>（大小写不敏感）；未声明或非法值记为<strong>默认 Lax</strong>；<code>SameSite=None</code> 未带 <code>Secure</code> 时<strong>拒绝入罐</strong>。</li>
+        <li><strong>站点（site）：</strong>scheme + 可注册域（eTLD+1，由公共后缀列表 PSL 判定，如 <code>https://example.com</code>）；IP 与 localhost 按完整主机比较。请求站 = 顶层站即「同站」。</li>
+        <li><strong>发送限制：</strong><code>Strict</code> 仅同站发送；显式 <code>Lax</code> 仅同站或跨站顶层导航的安全方法（GET/HEAD/OPTIONS/TRACE）发送；<strong>默认 Lax</strong> 额外允许创建不超过 <strong>120 秒</strong>的跨站顶层 POST；<code>None</code> 跨站照常发送（已强制 Secure）。</li>
+        <li><strong>排序：</strong>发送时按 Path 长度降序，Path 等长时按首次创建顺序升序，再以 <code>; </code> 拼接成 Cookie 头。</li>
+      </ul>
+    </details>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
