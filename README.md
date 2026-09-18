@@ -5,6 +5,10 @@
 更新内存 Cookie 罐；再输入请求 URL（以及顶层页面 URL、方法、是否顶层导航），即可看到生成的
 `Cookie` 请求头，以及每一项**被发送或被排除的具体原因**（含 SameSite 站点演算）。
 
+此外支持 **Cookie Priority 与容量压力模拟**：为每个可注册域与全局设置条目数上限，
+观察入罐时「先域级、后全局」的淘汰过程——先清过期项，再按
+**优先级低 → 高、最近访问早 → 晚、创建序号小 → 大**逐条淘汰，并给出完整淘汰清单与排序依据。
+
 技术栈：**TypeScript + Express + 原生 HTML/CSS/JS**（前端无框架、无构建），数据仅存内存；
 same-site 判定使用 [tldts](https://github.com/remusao/tldts)（内置公共后缀列表 PSL，含私有域段）。
 
@@ -53,7 +57,30 @@ docker compose down --rmi local   # 同时删除本工具镜像
    - 📤 **发送项**：命中的主机 / Path / Secure / SameSite 匹配点
    - 🚫 **排除项**：过期、Domain 不匹配、Path 不匹配、Secure 受限、SameSite 拦截等逐项原因
 3. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、Secure、
-   有效期剩余、创建序号）；点击 **重置** 清空内存罐。
+   Priority、有效期剩余、创建序号、**最近访问时间**）；点击 **重置** 清空内存罐。
+4. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
+   留空 = 不限），点击 **应用容量设置** 立即按新上限执行一次淘汰；之后每次入罐通过校验都会
+   自动依次执行域级、全局淘汰。面板中实时显示全局与各域用量（`当前条数/上限`），
+   入罐结果区会展示**本次触发的淘汰清单**（过期清理 / 容量淘汰、逐条排序依据）。
+
+### 容量淘汰的顺序
+
+每次入罐（含覆盖更新）通过既有全部校验后，按以下顺序处理压力：
+
+1. **域级淘汰**：仅针对新条目所属的**可注册域**（eTLD+1；IP / localhost 按完整主机），
+   且仅当该域设置了容量上限；
+2. **全局淘汰**：随后针对全罐，且仅当设置了全局限额。
+
+每一级超限时（范围内条数 > 上限）：
+
+1. **先物理清理范围内已过期的条目**；
+2. 若仍超限，把存活条目依次按
+   **Priority 从低到高（Low → Medium → High）→ 最近访问时间从早到晚 → 创建序号从小到大**
+   排序，从最前开始逐条淘汰，直到条数回到上限；
+3. 新入罐的条目自身也可能立刻被淘汰（结果中会明确提示）。
+
+**最近访问时间（LRA）**在创建 / 覆盖更新时写入；条目在请求演算中**发送成功**即刷新。
+修改容量设置时，会对所有已配置的上限（域级逐个、随后全局）立即执行一轮上述流程。
 
 ### 推荐演算示例（按顺序）
 
@@ -69,6 +96,17 @@ docker compose down --rmi local   # 同时删除本工具镜像
 | 8 | `https://example.com/` | `xs=1; Path=/; SameSite=None` | **拒绝**：SameSite=None 未带 Secure |
 | 9 | `https://example.com/` | `xs=1; Path=/; Secure; SameSite=None` | 入罐（跨站也发送，但仅 https） |
 | 10 | `https://example.com/` | `weird=1; Path=/; SameSite=Banana` | 入罐（非法值 → **默认 Lax** 并提示） |
+| 11 | `https://example.com/` | `cart=1; Path=/; Priority=Low` | 入罐（Priority=Low；容量超限时最先被淘汰） |
+| 12 | `https://example.com/` | `vip=1; Path=/; Priority=Nope` | 入罐（Priority 非法 → **Medium** 并提示） |
+
+容量压力演算（右栏 **🎚️ 容量压力模拟**，或 `POST /api/capacity`）：
+
+- 先设置 `example.com` 域容量为 **2**，再连续入罐 3 条同 Path 的 cookie：
+  第 3 条入罐后触发域级淘汰，**Low 先于 Medium 先于 High** 出局；
+- 把其中一条的 `Max-Age=1` 设为已过期：下次超限时**先清过期项**，清完不超限就不再淘汰；
+- 连续请求某条 cookie（同站 GET 命中它）刷新其最近访问时间，再制造超限：
+  同优先级下**最久未访问**的先出局；
+- 再设一个较小的**全局容量**（如 3），观察跨域入罐时「域级 → 全局」两级报告依次出现。
 
 然后分别用以下请求 URL 观察差异：
 
@@ -109,7 +147,18 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
   - 解析 `Strict` / `Lax` / `None`（**大小写不敏感**）；
   - **未声明或值非法 → 记为默认 Lax**（非法值会给出提示）；
   - **`SameSite=None` 未同时声明 `Secure` → 拒绝入罐**（现代浏览器的强制要求）。
-- **同名同域同路径**再次写入 → 覆盖更新，**沿用首次创建序号**（保证排序稳定）。
+- **Priority**（RFC 6265bis，仅参与容量淘汰，不影响发送）
+  - 解析 `Low` / `Medium` / `High`（**大小写不敏感**）；
+  - **缺省或非法值 → 按 Medium**（都会给出提示；缺省提示「按默认 Medium 参与容量淘汰」）。
+- **同名同域同路径**再次写入 → 覆盖更新，**沿用首次创建序号**（保证排序稳定），
+  并刷新该条目的最近访问时间。
+- **容量压力淘汰**（入罐通过以上全部校验后执行；未设置任何上限时完全不干预）
+  - 可分别为每个**可注册域**（eTLD+1，tldts/PSL 判定；IP、localhost 按完整主机分桶）
+    与**全局**设置条目数上限；
+  - 入罐后**先域级（仅新条目所属可注册域）后全局**；修改容量设置则对全部已配上限立即执行；
+  - 范围内条数超限时：**先清理过期项**，再按
+    **Priority 低 → 高、最近访问早 → 晚、创建序号小 → 大**淘汰至回到上限；
+  - **发送成功**的条目刷新最近访问时间，作为同级 Priority 的淘汰依据。
 
 ### 发送（处理请求 URL + SameSite 上下文）
 
@@ -150,10 +199,11 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
 
 | 方法 | 路径 | Body（JSON） | 说明 |
 |------|------|--------------|------|
-| GET | `/api/jar` | — | 当前罐快照 |
-| POST | `/api/store` | `{ "url": "...", "setCookie": "..." }` | 顺序写入一条 Set-Cookie |
-| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true }` | 演算 Cookie 头与逐项原因（SameSite 上下文均可缺省：顶层页=请求 URL、GET、顶层导航，即同站） |
-| POST | `/api/reset` | — | 清空内存罐 |
+| GET | `/api/jar` | — | 当前罐快照（`cookies` + `capacity`：容量设置与各可注册域用量） |
+| POST | `/api/store` | `{ "url": "...", "setCookie": "..." }` | 顺序写入一条 Set-Cookie；响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
+| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true }` | 演算 Cookie 头与逐项原因；发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
+| POST | `/api/capacity` | `{ "globalLimit"?: number \| null, "domainLimits"?: { "example.com": 3 } }` | 替换式设置全局 / 每可注册域容量（正整数；`null`/缺省 = 不限），立即执行一轮淘汰并返回报告 |
+| POST | `/api/reset` | — | 清空内存罐（**容量设置保留**） |
 
 curl 示例：
 
@@ -170,7 +220,16 @@ curl -s -X POST http://localhost:3000/api/send \
   -d '{"url":"https://api.shop.example.com/orders/123",
        "topUrl":"https://other.org/", "method":"GET", "topLevelNav":true}'
 
-# 重置
+# 设置容量：example.com 域 3 条、全局 10 条（立即按新上限执行一次淘汰）
+curl -s -X POST http://localhost:3000/api/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"globalLimit":10,"domainLimits":{"example.com":3}}'
+
+# 取消全部限制
+curl -s -X POST http://localhost:3000/api/capacity \
+  -H 'Content-Type: application/json' -d '{"globalLimit":null,"domainLimits":{}}'
+
+# 重置（罐清空，容量设置保留）
 curl -s -X POST http://localhost:3000/api/reset
 ```
 
@@ -185,10 +244,10 @@ curl -s -X POST http://localhost:3000/api/reset
 ├── package.json
 ├── tsconfig.json
 ├── src
-│   ├── server.ts           # Express 入口与 API
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite 站点演算）
+│   ├── server.ts           # Express 入口与 API（含容量设置接口）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/容量淘汰）
 └── public
-    ├── index.html          # 原生前端页面
+    ├── index.html          # 原生前端页面（含容量压力配置面板）
     ├── styles.css
     └── app.js
 ```
@@ -209,6 +268,8 @@ npm start          # 打开 http://localhost:3000
 npm run dev
 ```
 
-> 说明：本工具是**演算/教学工具**，Cookie 仅存于服务端进程内存，刻意只实现
-> Domain / Path / Max-Age / Secure / SameSite 等题目要求的规则；不处理 HttpOnly
-> 发送限制（仅展示标签）、Expires、cookie 大小/数量上限等。
+> 说明：本工具是**演算/教学工具**，Cookie 仅存于服务端进程内存，刻意聚焦
+> Domain / Path / Max-Age / Secure / SameSite / Priority 与容量压力淘汰等规则；
+> 不处理 HttpOnly 发送限制（仅展示标签）、Expires、单条 cookie 字节大小上限等。
+> 容量按**条目条数**模拟（RFC 6265bis 的每可注册域 180 条、全局 3000 条同型机制），
+> 时间精度取毫秒级，同一毫秒内的次序由创建序号兜底。

@@ -270,6 +270,176 @@ check "非法顶层 URL" "顶层页面 URL 非法" "$R"
 post /api/reset '{}' >/dev/null
 
 echo
+echo "------- Priority 与容量压力模拟 -------"
+
+echo "== P1. Priority 缺省 -> Medium（默认）+ 提示 =="
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"p_def=1; Path=/"}')
+check "入罐" '"action":"stored"' "$R"
+check "priority=medium" '"priority":"medium"' "$R"
+check "标记默认" '"priorityDefault":true' "$R"
+check "缺省提示" "Priority 属性缺省" "$R"
+check "标签 Medium（默认）" "Medium（默认）" "$R"
+check "最近访问字段" '"lastAccessedAt"' "$R"
+
+echo "== P2. Priority 非法 -> Medium（默认）+ 非法提示 =="
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"p_bad=1; Path=/; Priority=Ultra"}')
+check "入罐" '"action":"stored"' "$R"
+check "按 medium" '"priority":"medium"' "$R"
+check "非法提示" "Priority 值非法" "$R"
+
+echo "== P3. Low / High 大小写不敏感 =="
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"p_low=1; Path=/; Priority=low"}')
+check "low" '"priority":"low"' "$R"
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"p_high=1; Path=/; Priority=HIGH"}')
+check "high" '"priority":"high"' "$R"
+
+post /api/reset '{}' >/dev/null
+
+echo "== P4. 无容量限制时 eviction 为 null =="
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"x=1; Path=/"}')
+check "eviction=null" '"eviction":null' "$R"
+
+echo "== P5. 设置域级容量（cap.test=2） =="
+R=$(post /api/capacity '{"domainLimits":{"cap.test":2}}')
+check "capacity ok" '"ok":true' "$R"
+check "未超限不触发" '"triggered":false' "$R"
+J=$(curl -s "$BASE/api/jar")
+check "快照含上限" '"domain":"cap.test","limit":2' "$J"
+
+echo "== P6. 第 3 条入罐：超限时先淘汰 Low =="
+post /api/store '{"url":"https://cap.test/","setCookie":"m=1; Path=/; Priority=Medium"}' >/dev/null
+post /api/store '{"url":"https://cap.test/","setCookie":"h=1; Path=/; Priority=High"}' >/dev/null
+R=$(post /api/store '{"url":"https://cap.test/","setCookie":"l=1; Path=/; Priority=Low"}')
+check "触发淘汰" '"triggered":true' "$R"
+check "域级阶段" '"scope":"domain"' "$R"
+check "淘汰 Low 项" '"cookie":"l=1"' "$R"
+check "淘汰原因含排序依据" "优先级从低到高" "$R"
+check "淘汰原因含最近访问" "最近访问" "$R"
+check "淘汰原因含创建序号" "创建序号" "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);print(','.join(sorted(c['name'] for c in d['jar'])))")
+check "剩 h,m" "h,m" "$HDR"
+
+echo "== P7. 子域共用可注册域桶（sub.cap.test 计入 cap.test） =="
+R=$(post /api/store '{"url":"https://sub.cap.test/","setCookie":"sub=1; Path=/; Priority=High"}')
+check "域级再淘汰" '"scope":"domain"' "$R"
+check "Medium 先于 High 出局" '"cookie":"m=1"' "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+names=sorted(c['name'] for c in d['cookies'])
+assert names==['h','sub'], names
+u=[x for x in d['capacity']['usage'] if x['domain']=='cap.test'][0]
+assert (u['count'],u['limit'])==(2,2), u
+print('✅ 子域同桶且用量 2/2')" && PASS=$((PASS+1)) || { echo "❌ 子域桶/用量错误"; FAIL=$((FAIL+1)); }
+
+echo "== P8. 另一可注册域不受 cap.test 上限影响 =="
+R=$(post /api/store '{"url":"https://other.site/","setCookie":"o=1; Path=/"}')
+if [[ "$R" == *'"triggered":true'* ]]; then echo "❌ 无关域被淘汰"; FAIL=$((FAIL+1));
+else echo "✅ 无关域不触发淘汰"; PASS=$((PASS+1)); fi
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P9. 超限时先清理过期项，清完不超限则不淘汰 =="
+post /api/capacity '{"domainLimits":{"exp.cap":2}}' >/dev/null
+post /api/store '{"url":"https://a.exp.cap/","setCookie":"dead=1; Path=/; Max-Age=1; Priority=High"}' >/dev/null
+post /api/store '{"url":"https://a.exp.cap/","setCookie":"lowc=1; Path=/; Priority=Low"}' >/dev/null
+sleep 1.3
+R=$(post /api/store '{"url":"https://a.exp.cap/","setCookie":"medc=1; Path=/; Priority=Medium"}')
+check "过期清理 1 条" '"expiredRemoved":1' "$R"
+check "无需优先级淘汰" '"evictedCount":0' "$R"
+check "清单标过期清理" '"reason":"expired"' "$R"
+check "Low 项存活" '"name":"lowc"' "$R"
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P10. 全局容量淘汰（跨域总条数） =="
+post /api/capacity '{"globalLimit":3}' >/dev/null
+post /api/store '{"url":"https://g1.test/","setCookie":"a=1; Path=/; Priority=Medium"}' >/dev/null
+post /api/store '{"url":"https://g2.test/","setCookie":"b=1; Path=/; Priority=High"}' >/dev/null
+post /api/store '{"url":"https://g3.test/","setCookie":"c=1; Path=/; Priority=Medium"}' >/dev/null
+R=$(post /api/store '{"url":"https://g4.test/","setCookie":"d=1; Path=/; Priority=Low"}')
+check "全局阶段" '"scope":"global"' "$R"
+check "Low 出局" '"cookie":"d=1"' "$R"
+check "上限 3" '"limit":3' "$R"
+J=$(curl -s "$BASE/api/jar")
+check "全局用量 3/3" '"totalCount":3' "$J"
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P11. 域级先于全局：同次入罐两级分别出报告 =="
+post /api/capacity '{"globalLimit":3,"domainLimits":{"two.test":1}}' >/dev/null
+post /api/store '{"url":"https://two.test/","setCookie":"t1=1; Path=/; Priority=High"}' >/dev/null
+post /api/store '{"url":"https://u1.test/","setCookie":"u1=1; Path=/; Priority=Medium"}' >/dev/null
+post /api/store '{"url":"https://u2.test/","setCookie":"u2=1; Path=/; Priority=Low"}' >/dev/null
+R=$(post /api/store '{"url":"https://two.test/","setCookie":"t2=2; Path=/; Priority=Medium"}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+stages=d['eviction']['stages']
+assert len(stages)==2, stages
+ds, gs = stages
+assert ds['scope']=='domain' and gs['scope']=='global', stages
+# 域级：t2(Medium) 比 t1(High) 先出局（新来者同样可被淘汰）
+assert ds['triggered'] and ds['removed'][0]['cookie']=='t2=1' or ds['removed'][0]['cookie']=='t2=2', ds
+assert ds['removed'][0]['cookie']=='t2=2', ds
+# 域级淘汰后总数仍为 3，全局阶段执行但未超限
+assert not gs['triggered'] and gs['beforeCount']==3, gs
+print('✅ 域级先触发（Medium 的 t2 先于 High 的 t1 出局），全局阶段随后执行但未超限')" && PASS=$((PASS+1)) || { echo "❌ 两级顺序错误"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P12. LRA：发送成功刷新最近访问时间，最久未访问先淘汰（同优先级）=="
+post /api/capacity '{"domainLimits":{"lra.test":2}}' >/dev/null
+post /api/store '{"url":"https://lra.test/keep","setCookie":"c1=1; Path=/keep; Priority=Medium"}' >/dev/null
+sleep 1.2
+post /api/store '{"url":"https://lra.test/other","setCookie":"c2=2; Path=/other; Priority=Medium"}' >/dev/null
+sleep 1.2
+# 仅请求 /keep：只发送 c1，c1 的最近访问时间被刷新
+post /api/send '{"url":"https://lra.test/keep/x"}' >/dev/null
+sleep 1.2
+R=$(post /api/store '{"url":"https://lra.test/z","setCookie":"c3=3; Path=/z; Priority=Medium"}')
+check "淘汰最久未访问的 c2" '"cookie":"c2=2"' "$R"
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== P13. 修改容量立即执行一次淘汰 =="
+post /api/store '{"url":"https://imm.test/","setCookie":"hi=1; Path=/; Priority=High"}' >/dev/null
+post /api/store '{"url":"https://imm.test/","setCookie":"me=1; Path=/; Priority=Medium"}' >/dev/null
+post /api/store '{"url":"https://imm.test/","setCookie":"lo=1; Path=/; Priority=Low"}' >/dev/null
+R=$(post /api/capacity '{"globalLimit":2}')
+check "立即淘汰" '"cookie":"lo=1"' "$R"
+check "返回最新罐" '"name":"hi"' "$R"
+
+echo "== P14. 容量参数校验 =="
+R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/capacity" -H 'Content-Type: application/json' -d '{"globalLimit":0}')
+[ "$R" = "400" ] && { echo "✅ 容量 0 拒绝（400）"; PASS=$((PASS+1)); } || { echo "❌ 容量 0 应 400，实际 $R"; FAIL=$((FAIL+1)); }
+R=$(curl -s -X POST "$BASE/api/capacity" -H 'Content-Type: application/json' -d '{"globalLimit":"abc"}')
+check "非数字报错" "正整数" "$R"
+R=$(curl -s -X POST "$BASE/api/capacity" -H 'Content-Type: application/json' -d '{"domainLimits":{"   ":2}}')
+check "空域名报错" "空的域名" "$R"
+
+post /api/reset '{}' >/dev/null
+J=$(curl -s "$BASE/api/jar")
+check "重置保留容量设置（globalLimit=2）" '"globalLimit":2' "$J"
+
+echo "== P15. IP 主机按完整主机独立分桶 =="
+post /api/capacity '{"domainLimits":{"10.1.1.1":1}}' >/dev/null
+post /api/store '{"url":"http://10.1.1.1/","setCookie":"ip1=1; Path=/"}' >/dev/null
+R=$(post /api/store '{"url":"http://10.1.1.1/","setCookie":"ip2=2; Path=/"}')
+check "同 IP 超限淘汰" '"cookie":"ip1=1"' "$R"
+R=$(post /api/store '{"url":"http://10.1.1.2/","setCookie":"ip3=3; Path=/"}')
+if [[ "$R" != *'"cookie":"ip3=3"'*'"reason":"evicted"'* ]] && [[ "$R" != *'"triggered": true'* ]]; then echo "✅ 另一 IP 独立桶不触发"; PASS=$((PASS+1)); else echo "❌ IP 桶未独立"; FAIL=$((FAIL+1)); fi
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

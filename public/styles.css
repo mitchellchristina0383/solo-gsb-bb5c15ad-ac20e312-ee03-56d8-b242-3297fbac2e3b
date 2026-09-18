@@ -370,6 +370,66 @@ select:focus {
 .domain-val { font-family: var(--mono); font-size: 11.5px; }
 .dim { color: var(--text-faint); font-size: 11.5px; }
 
+/* ---------- 容量压力面板 ---------- */
+.capacity-card { margin-bottom: 20px; }
+.capacity-card .jar-head h2 { margin: 0; font-size: 16px; }
+.cap-global { margin-bottom: 12px; }
+.cap-domains-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.cap-domains { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.cap-row { display: flex; gap: 6px; align-items: center; }
+.cap-row input[type="text"] { padding: 7px 9px; font-size: 12px; }
+.cap-row .cap-domain { flex: 3 1 0; min-width: 0; }
+.cap-row .cap-limit { flex: 1 1 52px; min-width: 0; }
+.btn.tiny { padding: 6px 9px; font-size: 12px; line-height: 1; }
+.cap-actions { margin-top: 4px; }
+
+.cap-usage {
+  margin: 10px 0 4px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: var(--bg-soft);
+  font-size: 12px;
+}
+.cap-usage:empty { display: none; }
+.cap-usage-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+  color: var(--text-dim);
+}
+.cap-usage-row.over { color: var(--red); font-weight: 600; }
+.cap-usage-global { border-bottom: 1px solid var(--card-border); margin-bottom: 3px; padding-bottom: 4px; color: var(--text); }
+.cap-usage-num { white-space: nowrap; }
+
+/* ---------- 容量淘汰清单 ---------- */
+.eviction-box {
+  margin-top: 10px;
+  border: 1px solid rgba(240,160,32,.35);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(240,160,32,.06);
+}
+.eviction-basis {
+  margin: 8px 0 2px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.eviction-basis strong { color: #f3c168; }
+.eviction-stage { margin-top: 8px; }
+.item.evicted { border-left-color: var(--primary); }
+.tag.evict { background: var(--amber-bg); color: #f3c168; }
+.badge.pr-high { background: var(--red-bg); color: #f08b84; }
+.badge.pr-medium { background: var(--blue-bg); color: var(--blue); }
+.badge.pr-low { background: rgba(154,163,181,.18); color: var(--text-dim); }
+
 /* ---------- 底部规则 ---------- */
 .rules-note {
   padding-bottom: 40px;

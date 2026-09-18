@@ -28,9 +28,9 @@
         </label>
 
         <label class="field">
-          <span class="field-label">单条 Set-Cookie（不含 <code>Set-Cookie:</code> 前缀）</span>
+          <span class="field-label">单条 Set-Cookie（不含 <code>Set-Cookie:</code> 前缀；支持 <code>Priority=Low/Medium/High</code>）</span>
           <input id="store-cookie" type="text" spellcheck="false" autocomplete="off"
-            placeholder='例如：session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure' />
+            placeholder='例如：session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure; Priority=High' />
         </label>
 
         <div class="row">
@@ -83,8 +83,36 @@
       </section>
     </div>
 
-    <!-- 右列：罐子 -->
+    <!-- 右列：容量压力 + 罐子 -->
     <aside class="col-side">
+      <section class="card capacity-card" id="capacity-card">
+        <div class="jar-head">
+          <h2>🎚️ 容量压力模拟</h2>
+        </div>
+        <p class="jar-count">按<strong>条目条数</strong>设置上限；入罐通过校验后依次执行域级、全局淘汰。留空 = 不限制。</p>
+
+        <div class="cap-global">
+          <label class="field-label" for="cap-global">全局容量（罐内总条目上限）</label>
+          <div class="cap-row">
+            <input id="cap-global" type="text" inputmode="numeric" placeholder="不限，例如 10" spellcheck="false" autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="cap-domains-head">
+          <span class="field-label">每个可注册域容量（eTLD+1；IP / localhost 按完整主机）</span>
+          <button id="cap-add" class="btn ghost tiny" type="button">+ 添加域</button>
+        </div>
+        <div id="cap-domains" class="cap-domains"></div>
+
+        <div id="cap-usage" class="cap-usage"></div>
+
+        <div class="row cap-actions">
+          <button id="cap-save" class="btn primary small" type="button">应用容量设置</button>
+          <button id="cap-clear" class="btn ghost small" type="button">全部取消限制</button>
+        </div>
+        <div id="cap-result" class="result-box hidden"></div>
+      </section>
+
       <section class="card jar-card">
         <div class="jar-head">
           <h2>🫙 当前 Cookie 罐</h2>
@@ -107,6 +135,9 @@
         <li><strong>Max-Age：</strong>正整数为相对有效期秒数；<code>Max-Age=0</code> 或负数会删除同名同域同路径项；非法值忽略（按会话 cookie）。Expires 属性不参与本演算。</li>
         <li><strong>Secure：</strong>仅在 https 请求中发送；明文 http 响应中设置 Secure 会给出提示。</li>
         <li><strong>SameSite：</strong>解析 <code>Strict / Lax / None</code>（大小写不敏感）；未声明或非法值记为<strong>默认 Lax</strong>；<code>SameSite=None</code> 未带 <code>Secure</code> 时<strong>拒绝入罐</strong>。</li>
+        <li><strong>Priority：</strong>解析 <code>Low / Medium / High</code>（大小写不敏感）；<strong>缺省或非法值按 Medium</strong>（非法值会给出提示）。容量淘汰时低优先级先出局。</li>
+        <li><strong>容量压力：</strong>可分别为每个<strong>可注册域</strong>（eTLD+1；IP / localhost 按完整主机）与<strong>全局</strong>设置条目数上限。入罐通过全部校验后，<strong>先执行域级淘汰、再执行全局淘汰</strong>；仅在范围内条数超限时动作：<strong>先清理过期项</strong>，仍超限再按 <strong>Priority 低→高、最近访问时间早→晚、创建序号小→大</strong> 依次淘汰，直到回到上限。修改容量设置会立即执行一次。</li>
+        <li><strong>最近访问（LRA）：</strong>创建 / 覆盖更新时写入访问时间；条目<strong>发送成功</strong>即刷新。同级 Priority 中越久未访问越先被淘汰。</li>
         <li><strong>站点（site）：</strong>scheme + 可注册域（eTLD+1，由公共后缀列表 PSL 判定，如 <code>https://example.com</code>）；IP 与 localhost 按完整主机比较。请求站 = 顶层站即「同站」。</li>
         <li><strong>发送限制：</strong><code>Strict</code> 仅同站发送；显式 <code>Lax</code> 仅同站或跨站顶层导航的安全方法（GET/HEAD/OPTIONS/TRACE）发送；<strong>默认 Lax</strong> 额外允许创建不超过 <strong>120 秒</strong>的跨站顶层 POST；<code>None</code> 跨站照常发送（已强制 Secure）。</li>
         <li><strong>排序：</strong>发送时按 Path 长度降序，Path 等长时按首次创建顺序升序，再以 <code>; </code> 拼接成 Cookie 头。</li>
