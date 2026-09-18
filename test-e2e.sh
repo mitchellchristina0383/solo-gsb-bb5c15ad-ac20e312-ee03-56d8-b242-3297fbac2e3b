@@ -12,6 +12,8 @@ check() { # desc  expected_substr  actual
 post() { curl -s -X POST "$BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 
 post /api/reset '{}' >/dev/null
+# 容量配置不随重置清空：显式清掉全局与各域上限，保证旧测试与重复运行互不干扰
+curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo "== 1. host-only cookie，默认 Path（/admin/dashboard -> /admin） =="
 R=$(post /api/store '{"url":"https://shop.example.com/admin/dashboard?tab=1","setCookie":"tracker=xyz; Max-Age=3600"}')
@@ -267,6 +269,232 @@ echo "== K9. 顶层页面 URL 非法 -> 报错 =="
 R=$(post /api/send '{"url":"https://ss.test/","topUrl":"not-a-url"}')
 check "非法顶层 URL" "顶层页面 URL 非法" "$R"
 
+post /api/reset '{}' >/dev/null
+
+echo
+echo "------- Priority 解析 -------"
+
+echo "== L1. Priority=High 显式解析 =="
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"hi=1; Path=/; Priority=High"}')
+check "入罐" '"action":"stored"' "$R"
+check "解析为 high" '"priority":"high"' "$R"
+check "非默认" '"priorityDefault":false' "$R"
+check "桶为可注册域 pr.test" '"bucket":"pr.test"' "$R"
+
+echo "== L2. Priority 缺省 -> 默认 Medium + 提示 =="
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"mid=1; Path=/"}')
+check "默认 medium" '"priority":"medium"' "$R"
+check "标记为默认" '"priorityDefault":true' "$R"
+check "缺省提示" "Priority 属性缺省" "$R"
+
+echo "== L3. Priority 非法值 -> 默认 Medium + 提示 =="
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"weirdp=1; Path=/; Priority=Urgent"}')
+check "入罐" '"action":"stored"' "$R"
+check "记为 medium" '"priority":"medium"' "$R"
+check "非法值提示" "Priority 值非法" "$R"
+
+echo "== L4. Priority 大小写不敏感（LOW） =="
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"lo=1; Path=/; Priority=LOW"}')
+check "解析为 low" '"priority":"low"' "$R"
+
+post /api/reset '{}' >/dev/null
+
+echo
+echo "------- 域级容量淘汰 -------"
+
+# 域级上限 2：pr.test 桶（含其子域 host-only）
+echo "== D1. 超过域级容量：按优先级从低到高淘汰 Low =="
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"a=1; Path=/; Priority=High","globalLimit":null,"domainLimits":{"pr.test":2}}')
+check "第 1 条入罐" '"action":"stored"' "$R"
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"b=2; Path=/; Priority=Low","globalLimit":null,"domainLimits":{"pr.test":2}}')
+check "第 2 条入罐" '"action":"stored"' "$R"
+R=$(post /api/store '{"url":"https://pr.test/","setCookie":"c=3; Path=/; Priority=Medium","globalLimit":null,"domainLimits":{"pr.test":2}}')
+check "第 3 条入罐" '"action":"stored"' "$R"
+check "域级触发淘汰" '"scope":"domain"' "$R"
+check "淘汰了 Low 的 b" '"name":"b"' "$R"
+check "b 被标记 evicted" '"status":"evicted"' "$R"
+check "排序依据含优先级" "优先级从低到高" "$R"
+check "排序依据含最近访问" "最近访问时间从早到晚" "$R"
+check "排序依据含创建序号" "创建序号从小到大" "$R"
+check "新条目 c 仍在罐" '"name":"c"' "$R"
+J=$(curl -s "$BASE/api/jar")
+if [[ "$J" != *'"name":"b"'* ]]; then echo "✅ 被淘汰的 b 已不在罐中"; PASS=$((PASS+1));
+else echo "❌ b 应已被域级淘汰"; FAIL=$((FAIL+1)); fi
+check "域级用量 2/2" '"bucket":"pr.test","count":2,"limit":2' "$J"
+
+echo "== D2. host-only 子域与上级 Domain cookie 同一可注册域桶 =="
+R=$(post /api/store '{"url":"https://api.pr.test/","setCookie":"sub=9; Path=/; Priority=High","globalLimit":null,"domainLimits":{"pr.test":2}}')
+check "子域入罐触发同桶淘汰" '"scope":"domain"' "$R"
+J=$(curl -s "$BASE/api/jar")
+# 上一轮剩 a(High) 与 c(Medium)；c 优先级低，应被淘汰
+if [[ "$J" != *'"name":"c"'* ]] && [[ "$J" == *'"name":"a"'* ]] && [[ "$J" == *'"name":"sub"'* ]]; then
+  echo "✅ 同桶内 Medium 的 c 被淘汰，High 的 a/sub 保留"; PASS=$((PASS+1));
+else echo "❌ 同桶淘汰结果不符：$J"; FAIL=$((FAIL+1)); fi
+
+post /api/reset '{}' >/dev/null
+
+echo
+echo "------- 淘汰第二/三键：最近访问时间、创建序号 -------"
+
+# 同优先级（默认 Medium），全部 Path=/；先建 a、b，再发送一次让 a 的最近访问更新；
+# 域级上限 2，再入 c 时，b（最近访问更早）应先于 a 被淘汰
+echo "== T1. 同优先级按最近访问时间从早到晚淘汰 =="
+# a 放 /only-a，b 放 /b-zone（不会被 /only-a 请求命中）；请求 /only-a 只发送 a，只刷新 a 的最近访问。
+# 域级上限 2，再入 c 时，b（从未发送、最近访问更早）应先于 a 被淘汰。
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://ta.test/only-a","setCookie":"a=1; Path=/only-a","globalLimit":null,"domainLimits":{"ta.test":2}}' >/dev/null
+sleep 1.1
+post /api/store '{"url":"https://ta.test/b-zone/","setCookie":"b=2; Path=/b-zone","globalLimit":null,"domainLimits":{"ta.test":2}}' >/dev/null
+post /api/send '{"url":"https://ta.test/only-a"}' >/dev/null   # 只发送 a，刷新 a 的最近访问时间
+sleep 1.1
+R=$(post /api/store '{"url":"https://ta.test/","setCookie":"c=3; Path=/","globalLimit":null,"domainLimits":{"ta.test":2}}')
+check "淘汰 b（最近访问更早）" '"name":"b"' "$R"
+# 校验淘汰顺序文本：a 最近访问更新过，b 未发送过 -> b 排在 a 前
+B_AT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+st=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+order=[e['name'] for e in st['order']]
+print(order.index('b') if 'b' in order else -1)")
+A_AT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+st=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+order=[e['name'] for e in st['order']]
+print(order.index('a') if 'a' in order else -1)")
+if [ "$B_AT" -ge 0 ] && [ "$A_AT" -ge 0 ] && [ "$B_AT" -lt "$A_AT" ]; then
+  echo "✅ 最近访问更早的 b 排在 a 前（b=$B_AT, a=$A_AT）"; PASS=$((PASS+1));
+else echo "❌ 最近访问时间排序错误 b=$B_AT a=$A_AT"; FAIL=$((FAIL+1)); fi
+
+echo "== T2. 最近访问相同时按创建序号从小到大淘汰 =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://ti.test/","setCookie":"x=1; Path=/","globalLimit":null,"domainLimits":{"ti.test":2}}' >/dev/null
+post /api/store '{"url":"https://ti.test/","setCookie":"y=2; Path=/","globalLimit":null,"domainLimits":{"ti.test":2}}' >/dev/null
+R=$(post /api/store '{"url":"https://ti.test/","setCookie":"z=3; Path=/","globalLimit":null,"domainLimits":{"ti.test":2}}')
+check "淘汰创建更早的 x" '"name":"x"' "$R"
+X_AT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+st=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+print([e['name'] for e in st['order']].index('x'))")
+Y_AT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+st=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+print([e['name'] for e in st['order']].index('y'))")
+if [ "$X_AT" -lt "$Y_AT" ]; then echo "✅ 创建序号 #x 更小，排在 y 前"; PASS=$((PASS+1));
+else echo "❌ 创建序号排序错误 x=$X_AT y=$Y_AT"; FAIL=$((FAIL+1)); fi
+
+post /api/reset '{}' >/dev/null
+
+echo
+echo "------- 全局容量淘汰 -------"
+
+echo "== G1. 全局超限时跨域淘汰最低优先级 =="
+post /api/store '{"url":"https://g1.test/","setCookie":"low1=1; Path=/; Priority=Low","globalLimit":2,"domainLimits":{}}' >/dev/null
+post /api/store '{"url":"https://g2.test/","setCookie":"hi2=2; Path=/; Priority=High","globalLimit":2,"domainLimits":{}}' >/dev/null
+R=$(post /api/store '{"url":"https://g3.test/","setCookie":"med3=3; Path=/; Priority=Medium","globalLimit":2,"domainLimits":{}}')
+check "全局阶段存在" '"scope":"global"' "$R"
+check "全局淘汰 Low" '"name":"low1"' "$R"
+J=$(curl -s "$BASE/api/jar")
+check "全局用量 2 条" '"globalCount":2' "$J"
+if [[ "$J" != *'"name":"low1"'* ]]; then echo "✅ low1 已被全局淘汰"; PASS=$((PASS+1));
+else echo "❌ low1 应被全局淘汰"; FAIL=$((FAIL+1)); fi
+
+echo "== G2. 先域级后全局：两级都可在同一次入罐出报告 =="
+R=$(post /api/store '{"url":"https://g4.test/","setCookie":"x4=4; Path=/; Priority=High","globalLimit":2,"domainLimits":{"g4.test":1}}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+scopes=[s['scope'] for s in d['eviction']['stages']]
+assert scopes==['domain','global'], scopes
+print('✅ 淘汰顺序：域级 -> 全局')
+" && PASS=$((PASS+1)) || { echo "❌ 淘汰阶段顺序错误"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+
+echo
+echo "------- 超限时先清理过期项 -------"
+
+echo "== E1. 过期项在域级超限时先被清理，无需淘汰未过期项 =="
+post /api/store '{"url":"https://ex.test/","setCookie":"old=1; Path=/; Max-Age=1","globalLimit":null,"domainLimits":{"ex.test":2}}' >/dev/null
+sleep 1.5
+# 入第 2 条时桶中名义 2 条（1 过期），上限 2：先清过期项即达标，不淘汰
+R=$(post /api/store '{"url":"https://ex.test/","setCookie":"fresh=2; Path=/; Max-Age=600","globalLimit":null,"domainLimits":{"ex.test":2}}')
+check "过期项被清理" '"status":"expired"' "$R"
+check "清理的是 old" '"name":"old"' "$R"
+EVICTED_HAS=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+st=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+print(len(st['evicted']))")
+if [ "$EVICTED_HAS" = "0" ]; then echo "✅ 清完过期项已达标，无按序淘汰"; PASS=$((PASS+1));
+else echo "❌ 不应再淘汰未过期项（evicted=$EVICTED_HAS）"; FAIL=$((FAIL+1)); fi
+J=$(curl -s "$BASE/api/jar")
+if [[ "$J" == *'"name":"fresh"'* ]] && [[ "$J" != *'"name":"old"'* ]]; then
+  echo "✅ fresh 保留、old 消失"; PASS=$((PASS+1));
+else echo "❌ 过期清理结果不符"; FAIL=$((FAIL+1)); fi
+
+echo "== E2. 发送成功更新最近访问时间（lastAccessAt 变化） =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://acc.test/","setCookie":"k=v; Path=/"}' >/dev/null
+BEFORE=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookies'][0]['lastAccessAt'])")
+sleep 1.1
+post /api/send '{"url":"https://acc.test/"}' >/dev/null
+AFTER=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookies'][0]['lastAccessAt'])")
+if [ "$BEFORE" != "$AFTER" ]; then echo "✅ 发送后最近访问时间更新：$BEFORE -> $AFTER"; PASS=$((PASS+1));
+else echo "❌ 最近访问时间未更新（$BEFORE）"; FAIL=$((FAIL+1)); fi
+
+echo "== E3. 覆盖更新刷新最近访问时间 =="
+sleep 1.1
+post /api/store '{"url":"https://acc.test/","setCookie":"k=v2; Path=/; Priority=High"}' >/dev/null
+UPDATED=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookies'][0]['lastAccessAt'])")
+if [ "$UPDATED" != "$AFTER" ]; then echo "✅ 覆盖更新刷新了最近访问时间"; PASS=$((PASS+1));
+else echo "❌ 覆盖更新未刷新最近访问时间"; FAIL=$((FAIL+1)); fi
+
+echo
+echo "------- 容量配置接口与校验 -------"
+
+echo "== C1. 未配置上限的级不触发 =="
+post /api/reset '{}' >/dev/null
+curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+post /api/store '{"url":"https://n.test/","setCookie":"a=1; Path=/"}' >/dev/null
+R=$(post /api/store '{"url":"https://n.test/","setCookie":"b=2; Path=/"}')
+check "两级都有限制字段" '"limited"' "$R"
+check "均未触发" '"triggered":false' "$R"
+
+echo "== C2. 非法容量被 400 拒绝 =="
+R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":0}')
+if [ "$R" = "400" ]; then echo "✅ globalLimit=0 返回 400"; PASS=$((PASS+1));
+else echo "❌ 应返回 400，实际 $R"; FAIL=$((FAIL+1)); fi
+R=$(curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"domainLimits":{"x.test":-3}}')
+check "负数容量报错" "≥1 的整数" "$R"
+
+echo "== C3. 修改容量本身不立即淘汰（仅在下次入罐时生效） =="
+curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":1}' >/dev/null
+J=$(curl -s "$BASE/api/jar")
+CNT=$(echo "$J" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['cookies']))")
+if [ "$CNT" = "2" ]; then echo "✅ 调小容量后罐中仍是 2 条（未立即淘汰）"; PASS=$((PASS+1));
+else echo "❌ 修改容量不应立即淘汰（实际 $CNT 条）"; FAIL=$((FAIL+1)); fi
+
+echo "== C4. 重置罐保留容量配置 =="
+post /api/reset '{}' >/dev/null
+L=$(curl -s "$BASE/api/limits")
+check "容量配置保留" '"globalLimit":1' "$L"
+
+echo "== C5. 新写入条目自身也可能被立即淘汰（同优先级创建序号最大反而保留高优先级新条目场景） =="
+curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://self.test/","setCookie":"keep=1; Path=/; Priority=High","domainLimits":{"self.test":1}}' >/dev/null
+R=$(post /api/store '{"url":"https://self.test/","setCookie":"newlow=2; Path=/; Priority=Low","domainLimits":{"self.test":1}}')
+check "新条目被立即淘汰标记" '"storedCookieEvicted":true' "$R"
+J=$(curl -s "$BASE/api/jar")
+if [[ "$J" != *'"name":"newlow"'* ]] && [[ "$J" == *'"name":"keep"'* ]]; then
+  echo "✅ Low 新条目被立即淘汰，High 旧条目保留"; PASS=$((PASS+1));
+else echo "❌ 自淘汰场景结果不符"; FAIL=$((FAIL+1)); fi
+
+# 收尾：恢复无限制并清空
+curl -s -X POST "$BASE/api/limits" -H 'Content-Type: application/json' -d '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 post /api/reset '{}' >/dev/null
 
 echo

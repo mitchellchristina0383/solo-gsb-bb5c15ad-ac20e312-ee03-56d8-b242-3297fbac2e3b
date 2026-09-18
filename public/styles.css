@@ -114,7 +114,7 @@ html, body {
   margin-bottom: 6px;
 }
 .field-label code { font-size: 12px; }
-input[type="text"] {
+input[type="text"], input[type="number"] {
   width: 100%;
   background: var(--bg-soft);
   border: 1px solid var(--card-border);
@@ -126,7 +126,7 @@ input[type="text"] {
   outline: none;
   transition: border-color .15s, box-shadow .15s;
 }
-input[type="text"]:focus {
+input[type="text"]:focus, input[type="number"]:focus {
   border-color: var(--primary-dim);
   box-shadow: 0 0 0 3px rgba(240, 160, 32, 0.15);
 }
@@ -404,3 +404,120 @@ select:focus {
   z-index: 100;
 }
 .toast.show { opacity: 1; }
+
+/* ---------- 容量压力模拟 ---------- */
+.limits-card { margin-bottom: 20px; }
+.limits-card h2 { margin-bottom: 8px; }
+.limits-hint {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+.limits-hint strong { color: var(--text); }
+
+.limits-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.limits-field { flex: 1 1 auto; margin-bottom: 0; min-width: 0; }
+.limits-usage { flex: 0 0 auto; padding-bottom: 8px; }
+
+.perdomain-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.domain-limits-list { display: flex; flex-direction: column; gap: 8px; }
+.domain-limit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px 30px;
+  gap: 8px;
+  align-items: center;
+}
+.domain-limit-row input { padding: 7px 9px; font-size: 12.5px; }
+.dl-del {
+  padding: 4px 0;
+  font-size: 15px;
+  line-height: 1;
+}
+.small-hint { padding: 10px 8px; font-size: 12px; margin: 0; }
+
+.usage-pill {
+  display: inline-block;
+  font-size: 11px;
+  font-family: var(--mono);
+  border-radius: 10px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+.usage-pill.over {
+  background: var(--red-bg);
+  color: var(--red);
+  border: 1px solid rgba(229, 83, 75, 0.4);
+}
+.usage-pill.dim-pill {
+  background: rgba(154,163,181,.12);
+  color: var(--text-dim);
+  border: 1px solid var(--card-border);
+}
+.limits-usage-box { margin-top: 12px; }
+.usage-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+
+/* Priority 徽章 */
+.badge.pr-high { background: var(--red-bg); color: #f08b84; }
+.badge.pr-medium { background: var(--amber-bg); color: #f3c168; }
+.badge.pr-low { background: rgba(154,163,181,.15); color: var(--text-dim); }
+
+/* ---------- 容量淘汰清单 ---------- */
+.eviction-box { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.evict-head { margin-top: 4px; }
+.evict-stage {
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+.evict-stage.triggered { border-color: rgba(240,160,32,.45); }
+.evict-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.evict-summary { color: var(--text-dim); font-size: 12.5px; margin-top: 4px; }
+
+.evict-item {
+  border: 1px solid var(--card-border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  padding: 7px 11px;
+  background: var(--card);
+  font-size: 12.5px;
+}
+.evict-expired { border-left-color: var(--text-faint); opacity: .9; }
+.evict-evicted { border-left-color: var(--red); }
+.evict-kept { border-left-color: var(--green); opacity: .85; }
+.evict-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tag.tag-expired { background: rgba(154,163,181,.18); color: var(--text-dim); }
+.tag.tag-evicted { background: var(--red-bg); color: var(--red); }
+.tag.tag-kept { background: var(--green-bg); color: var(--green); }
+
+.evict-order { margin-top: 8px; }
+.evict-order summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--blue);
+  user-select: none;
+}
+.evict-order .order-basis {
+  margin: 6px 0 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}

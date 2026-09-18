@@ -12,6 +12,14 @@
  *   - Secure cookie 在明文 http 响应里写入会给出提示（真实浏览器通常拒绝）；
  *   - SameSite 解析 Strict/Lax/None（大小写不敏感）；未声明或非法值记为默认 Lax；
  *     SameSite=None 未同时声明 Secure 时拒绝入罐。
+ *   - Priority 解析 Low/Medium/High（大小写不敏感）；缺省或非法值记为默认 Medium 并提示。
+ *
+ *  容量压力模拟（入罐校验通过后执行，先域级、后全局）：
+ *   - 每个可注册域（eTLD+1；IP/localhost 按完整主机）与全局各有一个条数上限，缺省不限；
+ *   - 某一级超限时：先清理该范围内已过期项，再按
+ *     Priority 从低到高 → 最近访问时间从早到晚 → 创建序号从小到大，淘汰到达标；
+ *   - 发送成功（进入 Cookie 头）的条目更新最近访问时间；
+ *   - 每次入罐都返回两级淘汰清单、被淘汰原因与候选淘汰排序依据。
  *
  *  发送（请求 URL + 顶层页面 URL + 方法 + 是否顶层导航）：
  *   - 已过期的不发送；
@@ -31,6 +39,18 @@ import { getDomain } from 'tldts';
 /** SameSite 模式（存储时统一为小写） */
 export type SameSiteMode = 'strict' | 'lax' | 'none';
 
+/** Priority 模式（RFC 6265bis，存储时统一为小写；缺省/非法均按 medium） */
+export type PriorityMode = 'low' | 'medium' | 'high';
+
+/** 淘汰排序时的优先级权重：低优先级先被淘汰 */
+const PRIORITY_RANK: Record<PriorityMode, number> = { low: 0, medium: 1, high: 2 };
+
+/** 容量配置：全局与每个可注册域的条数上限；undefined 表示不限 */
+export interface Limits {
+  global?: number;
+  perDomain?: Record<string, number>;
+}
+
 /** 罐中的单条 cookie（存储模型） */
 export interface StoredCookie {
   name: string;
@@ -46,6 +66,10 @@ export interface StoredCookie {
   sameSite: SameSiteMode;
   /** true = SameSite 为默认值（未声明或非法值）；默认 Lax 才享受 120 秒跨站顶层 POST 宽限 */
   sameSiteDefault: boolean;
+  /** Priority 模式；缺省或非法值一律记为 medium */
+  priority: PriorityMode;
+  /** true = Priority 为默认值（缺省或非法值），界面以「Medium（默认）」展示 */
+  priorityDefault: boolean;
   /** 过期绝对时间戳（ms）；undefined 表示会话 cookie（本工具中永不过期，重启清空） */
   expiresAt?: number;
   /** 首次创建序号，从 1 开始；更新同名项时沿用，保证排序稳定 */
@@ -54,6 +78,8 @@ export interface StoredCookie {
   createdAt: number;
   /** 最近一次写入（创建或更新）的时间戳 */
   updatedAt: number;
+  /** 最近访问时间戳：创建/更新时取写入时间；每次发送成功（进入 Cookie 头）时更新；容量淘汰的第二排序键 */
+  lastAccessAt: number;
 }
 
 /** 解析后的 Set-Cookie（单条） */
@@ -72,6 +98,11 @@ export interface ParsedSetCookie {
   sameSiteDefault: boolean;
   /** 原始 SameSite 值是否非法（非法时按默认 Lax 处理并给出提示） */
   sameSiteInvalid: boolean;
+  priority: PriorityMode;
+  /** true = 未声明 Priority 或值非法，按默认 Medium 处理 */
+  priorityDefault: boolean;
+  /** 原始 Priority 值是否非法（非法时按默认 Medium 处理并给出提示） */
+  priorityInvalid: boolean;
 }
 
 /** 前端表格 / API 共用的展示视图 */
@@ -89,16 +120,92 @@ export interface CookieView {
   sameSiteDefault: boolean;
   /** 展示用标签，例如 Strict / Lax（默认）/ None */
   sameSiteLabel: string;
+  priority: PriorityMode;
+  priorityDefault: boolean;
+  /** 展示用标签，例如 High / Medium（默认）/ Low */
+  priorityLabel: string;
+  /** 容量统计归属的桶：可注册域（eTLD+1）；IP/localhost 为完整主机 */
+  bucket: string;
   persistent: boolean;
   expiresAt: string | null;
   remaining: string | null;
   expired: boolean;
   createdAt: string;
   updatedAt: string;
+  /** 最近访问时间（创建/更新，或最近一次发送成功） */
+  lastAccessAt: string;
 }
 
 export type StoreAction = 'stored' | 'updated' | 'deleted' | 'rejected';
 export type ItemVerdict = 'send' | 'exclude';
+
+/** 单次容量淘汰的候选条目（含淘汰排序依据） */
+export interface EvictionEntry {
+  index: number;
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  priority: PriorityMode;
+  priorityLabel: string;
+  expired: boolean;
+  /** expired = 过期清理；evicted = 按序淘汰；kept = 保留 */
+  status: 'expired' | 'evicted' | 'kept';
+  /** 该条目被清理/淘汰（或继续保留）的说明 */
+  detail: string;
+  createdAt: string;
+  lastAccessAt: string;
+}
+
+/** 一级（域级 / 全局）容量淘汰报告 */
+export interface EvictionStage {
+  /** domain = 域级（含具体可注册域）；global = 全局 */
+  scope: 'domain' | 'global';
+  /** scope=domain 时的可注册域 */
+  bucket: string | null;
+  /** 该级是否配置了上限（未配置则整级跳过） */
+  limited: boolean;
+  limit: number | null;
+  /** 入罐后、淘汰前该范围内的条数 */
+  beforeCount: number;
+  /** 淘汰结束后该范围内的条数 */
+  afterCount: number;
+  /** 是否实际触发了清理（过期清理或按序淘汰） */
+  triggered: boolean;
+  /** 先清理掉的已过期条目 */
+  expired: EvictionEntry[];
+  /** 再按 优先级→最近访问→创建序号 淘汰的条目 */
+  evicted: EvictionEntry[];
+  /** 淘汰时全体候选的完整排序（含最终保留项，前端可展开核对顺序） */
+  order: EvictionEntry[];
+  /** 排序依据的人类可读描述 */
+  orderBasis: string;
+  /** 未触发时的一句结论，例如「未超限，无需淘汰」 */
+  summary: string;
+}
+
+/** 一次入罐触发的完整容量淘汰报告：先域级、后全局 */
+export interface EvictionReport {
+  /** 新写入条目是否在本次淘汰中被立即淘汰 */
+  storedCookieEvicted: boolean;
+  stages: EvictionStage[];
+}
+
+/** 容量配置的对外视图（含实时用量） */
+export interface DomainUsage {
+  bucket: string;
+  count: number;
+  limit: number | null;
+  /** 已配置上限且当前条数达到/超过上限 */
+  over: boolean;
+}
+
+export interface LimitsView {
+  globalLimit: number | null;
+  globalCount: number;
+  globalOver: boolean;
+  domains: DomainUsage[];
+}
 
 export interface StoreResult {
   ok: boolean;
@@ -110,6 +217,8 @@ export interface StoreResult {
   notices: string[];
   cookie: CookieView | null;
   jar: CookieView[];
+  /** 入罐/更新成功时的两级（域级 → 全局）容量淘汰报告；删除/拒绝时为 null */
+  eviction: EvictionReport | null;
 }
 
 export interface RequestItem {
@@ -237,6 +346,9 @@ export function parseSetCookie(raw: string): ParsedSetCookie {
     sameSite: 'lax',
     sameSiteDefault: true,
     sameSiteInvalid: false,
+    priority: 'medium',
+    priorityDefault: true,
+    priorityInvalid: false,
   };
 
   for (let i = 1; i < segments.length; i += 1) {
@@ -279,6 +391,19 @@ export function parseSetCookie(raw: string): ParsedSetCookie {
           parsed.sameSite = 'lax';
           parsed.sameSiteDefault = true;
           parsed.sameSiteInvalid = true;
+        }
+        break;
+      }
+      case 'priority': {
+        // Low / Medium / High，大小写不敏感；缺省或非法值一律记为默认 Medium
+        const v = attrValue.toLowerCase();
+        if (v === 'low' || v === 'medium' || v === 'high') {
+          parsed.priority = v;
+          parsed.priorityDefault = false;
+        } else {
+          parsed.priority = 'medium';
+          parsed.priorityDefault = true;
+          parsed.priorityInvalid = true;
         }
         break;
       }
@@ -342,6 +467,22 @@ export function sameSiteLabel(sameSite: SameSiteMode, sameSiteDefault: boolean):
   return sameSiteDefault ? `${base}（默认）` : base;
 }
 
+/** Priority 展示标签：High / Medium / Medium（默认）/ Low */
+export function priorityLabel(priority: PriorityMode, priorityDefault: boolean): string {
+  const base = priority === 'high' ? 'High' : priority === 'low' ? 'Low' : 'Medium';
+  return priorityDefault ? `${base}（默认）` : base;
+}
+
+/**
+ * 容量统计桶：cookie 归属的可注册域（eTLD+1，tldts/PSL 判定）。
+ * host-only 主机与其上级 Domain cookie 落在同一桶（如 a.example.com 与 example.com 同桶）；
+ * IP、localhost 等无可注册域的主机按完整主机计桶。
+ */
+export function registrableDomain(host: string): string {
+  const domain = isIpAddress(host) ? null : getDomain(host, { allowPrivateDomains: true });
+  return domain ?? host;
+}
+
 /**
  * domain-match（RFC 5.1.3）：
  *  host-only cookie 要求 host 与 domain 完全相等；
@@ -384,6 +525,45 @@ export function pathMatch(requestPath: string, cookiePath: string): boolean {
 export class CookieJar {
   private cookies: StoredCookie[] = [];
   private nextIndex = 1;
+  /** 容量压力模拟配置：全局条数上限（undefined = 不限） */
+  private globalLimit: number | undefined;
+  /** 容量压力模拟配置：每个可注册域的条数上限 */
+  private domainLimits = new Map<string, number>();
+
+  /** 整体替换容量配置（undefined / 缺键 = 该级不限） */
+  setLimits(limits: Limits): void {
+    this.globalLimit = limits.global;
+    this.domainLimits = new Map(
+      Object.entries(limits.perDomain ?? {}).map(([k, v]) => [k.trim().toLowerCase(), v]),
+    );
+  }
+
+  /** 当前容量配置（供 API 回显） */
+  getLimits(): Limits {
+    return { global: this.globalLimit, perDomain: Object.fromEntries(this.domainLimits) };
+  }
+
+  /** 当前容量配置与实时用量（域级条目按可注册域归桶；过期项仍计入，入罐超限时才清理） */
+  limitsView(): LimitsView {
+    const counts = new Map<string, number>();
+    for (const c of this.cookies) {
+      const bucket = registrableDomain(c.domain);
+      counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+    }
+    const domains: DomainUsage[] = [...counts.keys()]
+      .sort()
+      .map((bucket) => {
+        const count = counts.get(bucket) ?? 0;
+        const limit = this.domainLimits.get(bucket);
+        return { bucket, count, limit: limit ?? null, over: limit !== undefined && count >= limit };
+      });
+    return {
+      globalLimit: this.globalLimit ?? null,
+      globalCount: this.cookies.length,
+      globalOver: this.globalLimit !== undefined && this.cookies.length >= this.globalLimit,
+      domains,
+    };
+  }
 
   /**
    * 按顺序处理一次「响应 URL + 单条 Set-Cookie」写入。
@@ -481,6 +661,11 @@ export class CookieJar {
     if (parsed.sameSiteInvalid) {
       notices.push('SameSite 值非法（仅识别 Strict / Lax / None，大小写不敏感），已按默认 Lax 处理');
     }
+    if (parsed.priorityInvalid) {
+      notices.push('Priority 值非法（仅识别 Low / Medium / High，大小写不敏感），已按默认 Medium 处理');
+    } else if (parsed.priorityDefault) {
+      notices.push('Priority 属性缺省，按默认 Medium 参与容量淘汰');
+    }
 
     const existing = this.findCookie(parsed.name, domain, cookiePath);
 
@@ -517,17 +702,28 @@ export class CookieJar {
       existing.httpOnly = parsed.httpOnly;
       existing.sameSite = parsed.sameSite;
       existing.sameSiteDefault = parsed.sameSiteDefault;
+      existing.priority = parsed.priority;
+      existing.priorityDefault = parsed.priorityDefault;
       existing.expiresAt = expiresAt;
       existing.updatedAt = now;
-      const view = this.toView(existing, now);
+      existing.lastAccessAt = now;
+
+      const eviction = this.enforceLimits(existing.domain, now);
+      const stillThere = this.cookies.includes(existing);
+      const evictedText = stillThere
+        ? ''
+        : '；注意：本次容量淘汰把刚覆盖更新的该条目也淘汰了（罐中已不存在）';
+      const view = stillThere ? this.toView(existing, now) : null;
       return {
         ok: true,
         action: 'updated',
-        reason: `同名同域同路径的 ${parsed.name} 已存在（#${existing.creationIndex}），覆盖更新（value/属性以新 Set-Cookie 为准，创建顺序沿用）`,
+        reason: `同名同域同路径的 ${parsed.name} 已存在（#${existing.creationIndex}），覆盖更新（value/属性以新 Set-Cookie 为准，创建顺序沿用，最近访问时间刷新为当前）` +
+          evictedText,
         inheritedIndex: existing.creationIndex,
         notices,
         cookie: view,
         jar: this.views(now),
+        eviction,
       };
     }
 
@@ -541,13 +737,20 @@ export class CookieJar {
       httpOnly: parsed.httpOnly,
       sameSite: parsed.sameSite,
       sameSiteDefault: parsed.sameSiteDefault,
+      priority: parsed.priority,
+      priorityDefault: parsed.priorityDefault,
       expiresAt,
       creationIndex: this.nextIndex,
       createdAt: now,
       updatedAt: now,
+      lastAccessAt: now,
     };
     this.nextIndex += 1;
     this.cookies.push(stored);
+
+    // ---- 7. 容量压力模拟：沿用上述全部校验结果，再依次执行域级、全局淘汰 ----
+    const eviction = this.enforceLimits(domain, now);
+    const stillThere = this.cookies.includes(stored);
 
     const scopeText = hostOnly
       ? `host-only：仅向主机 ${domain} 发送`
@@ -557,14 +760,20 @@ export class CookieJar {
         ? '会话 cookie（本工具中不过期，重置即清空）'
         : `Max-Age=${parsed.maxAge}s，将于 ${formatTime(expiresAt)} 过期`;
     const sameSiteText = `SameSite=${sameSiteLabel(parsed.sameSite, parsed.sameSiteDefault)}`;
-    return this.result(
-      true,
-      'stored',
-      `已入罐：${parsed.name}=${parsed.value}；${scopeText}；Path=${cookiePath}；${sameSiteText}；${lifeText}`,
+    const priorityText = `Priority=${priorityLabel(parsed.priority, parsed.priorityDefault)}`;
+    const evictedText = stillThere
+      ? ''
+      : '；注意：本次容量淘汰把刚入罐的该条目也立即淘汰了（罐中已不存在）';
+    return {
+      ok: true,
+      action: 'stored',
+      reason: `已入罐：${parsed.name}=${parsed.value}；${scopeText}；Path=${cookiePath}；${sameSiteText}；${priorityText}；${lifeText}` +
+        evictedText,
       notices,
-      parsed,
-      stored,
-    );
+      cookie: stillThere ? this.toView(stored, now) : null,
+      jar: this.views(now),
+      eviction,
+    };
   }
 
   /**
@@ -680,6 +889,12 @@ export class CookieJar {
       return a.index - b.index;
     });
 
+    // 发送成功（进入 Cookie 头）的条目更新最近访问时间——容量淘汰的第二排序键
+    const sentIndices = new Set(sent.map((i) => i.index));
+    for (const c of this.cookies) {
+      if (sentIndices.has(c.creationIndex)) c.lastAccessAt = now;
+    }
+
     const cookieHeader = sent.map((i) => i.cookie).join('; ');
 
     // 排除列表保持创建顺序，便于对照
@@ -717,6 +932,177 @@ export class CookieJar {
 
   private findCookie(name: string, domain: string, path: string): StoredCookie | undefined {
     return this.cookies.find((c) => c.name === name && c.domain === domain && c.path === path);
+  }
+
+  /**
+   * 容量压力模拟：入罐/更新成功后，依次执行域级、全局两级淘汰。
+   * 某一级超限时：先把该范围内已过期项清掉，再让候选按
+   * 「Priority 从低到高 → 最近访问时间从早到晚 → 创建序号从小到大」排序，从队首淘汰到达标；
+   * 未配置上限或未超限的级只出报告、不动数据。
+   */
+  private enforceLimits(storedDomain: string, now: number): EvictionReport {
+    const stored = this.cookies[this.cookies.length - 1];
+    const bucket = registrableDomain(storedDomain);
+    const orderBasis = '优先级从低到高（Low → Medium → High）；同优先级按最近访问时间从早到晚；仍相同按创建序号从小到大';
+
+    // ---- 域级：候选为同可注册域桶的条目（host-only 主机与其上级 Domain cookie 同桶）----
+    const domainLimit = this.domainLimits.get(bucket);
+    const domainStage = this.runStage(
+      'domain',
+      bucket,
+      domainLimit,
+      this.cookies.filter((c) => registrableDomain(c.domain) === bucket),
+      orderBasis,
+      now,
+    );
+
+    // ---- 全局：候选为域级淘汰后的全部条目 ----
+    const globalStage = this.runStage(
+      'global',
+      null,
+      this.globalLimit,
+      [...this.cookies],
+      orderBasis,
+      now,
+    );
+
+    return {
+      storedCookieEvicted: stored ? !this.cookies.includes(stored) : false,
+      stages: [domainStage, globalStage],
+    };
+  }
+
+  /**
+   * 执行一级容量淘汰。candidates 为该级范围内的条目（域级已按桶过滤）；
+   * 直接在 this.cookies 上删除过期项与被淘汰项，并返回该级的完整报告。
+   */
+  private runStage(
+    scope: 'domain' | 'global',
+    bucket: string | null,
+    limit: number | undefined,
+    candidates: StoredCookie[],
+    orderBasis: string,
+    now: number,
+  ): EvictionStage {
+    const scopeText = scope === 'domain' ? `域级（可注册域 ${bucket}）` : '全局';
+
+    if (limit === undefined) {
+      return {
+        scope,
+        bucket,
+        limited: false,
+        limit: null,
+        beforeCount: candidates.length,
+        afterCount: candidates.length,
+        triggered: false,
+        expired: [],
+        evicted: [],
+        order: [],
+        orderBasis,
+        summary: `${scopeText}未配置容量上限，不限制条数（${candidates.length} 条）`,
+      };
+    }
+
+    // ---- 1. 先清理该范围内的已过期项 ----
+    const expiredCookies = candidates.filter((c) => c.expiresAt !== undefined && c.expiresAt <= now);
+    if (expiredCookies.length > 0) {
+      const expiredSet = new Set(expiredCookies);
+      this.cookies = this.cookies.filter((c) => !expiredSet.has(c));
+      candidates = candidates.filter((c) => !expiredSet.has(c));
+    }
+
+    const beforeCount = candidates.length + expiredCookies.length;
+
+    // ---- 2. 仍超限：候选排序后从队首（最该被淘汰的一项）开始淘汰 ----
+    const sorted = [...candidates].sort((a, b) => {
+      const pr = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+      if (pr !== 0) return pr;
+      if (a.lastAccessAt !== b.lastAccessAt) return a.lastAccessAt - b.lastAccessAt;
+      return a.creationIndex - b.creationIndex;
+    });
+
+    const need = Math.max(0, candidates.length - limit);
+    const evictedCookies = sorted.slice(0, need);
+    if (evictedCookies.length > 0) {
+      const evictedSet = new Set(evictedCookies);
+      this.cookies = this.cookies.filter((c) => !evictedSet.has(c));
+    }
+
+    const expiredEntries = expiredCookies.map((c) =>
+      this.evictionEntry(c, 'expired', `已过期（${formatTime(c.expiresAt as number)}），超限时最先清理`, now),
+    );
+    const evictedEntries = evictedCookies.map((c, i) =>
+      this.evictionEntry(
+        c,
+        'evicted',
+        `淘汰排序第 ${i + 1} 位：${this.evictionRankText(c)}`,
+        now,
+      ),
+    );
+    const keptEntries = sorted.slice(need).map((c, i) =>
+      this.evictionEntry(
+        c,
+        'kept',
+        `淘汰排序第 ${need + i + 1} 位：${this.evictionRankText(c)}，容量内保留`,
+        now,
+      ),
+    );
+
+    const removed = expiredCookies.length + evictedCookies.length;
+    const triggered = removed > 0;
+    const over = beforeCount > limit;
+    const parts: string[] = [];
+    if (expiredCookies.length > 0) parts.push(`清理 ${expiredCookies.length} 条已过期`);
+    if (evictedCookies.length > 0) parts.push(`按序淘汰 ${evictedCookies.length} 条`);
+    const summary = triggered
+      ? `${scopeText}上限 ${limit} 条，入罐后 ${beforeCount} 条${parts.length ? '，' + parts.join('，') : ''}，余 ${beforeCount - removed} 条`
+      : over
+        ? `${scopeText}上限 ${limit} 条，当前 ${beforeCount} 条`
+        : `${scopeText}上限 ${limit} 条，当前 ${beforeCount} 条，未超限，无需淘汰`;
+
+    return {
+      scope,
+      bucket,
+      limited: true,
+      limit,
+      beforeCount,
+      afterCount: beforeCount - removed,
+      triggered,
+      expired: expiredEntries,
+      evicted: evictedEntries,
+      order: [...evictedEntries, ...keptEntries],
+      orderBasis,
+      summary,
+    };
+  }
+
+  /** 生成淘汰清单项；过期项的最近访问时间等如实展示 */
+  private evictionEntry(
+    c: StoredCookie,
+    status: 'expired' | 'evicted' | 'kept',
+    detail: string,
+    now: number,
+  ): EvictionEntry {
+    return {
+      index: c.creationIndex,
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      priority: c.priority,
+      priorityLabel: priorityLabel(c.priority, c.priorityDefault),
+      expired: c.expiresAt !== undefined && c.expiresAt <= now,
+      status,
+      detail,
+      createdAt: formatTime(c.createdAt),
+      lastAccessAt: formatTime(c.lastAccessAt),
+    };
+  }
+
+  /** 该条目在淘汰排序中的键值描述（用于清单中逐项说明） */
+  private evictionRankText(c: StoredCookie): string {
+    return `Priority=${priorityLabel(c.priority, c.priorityDefault)}` +
+      `，最近访问 ${formatTime(c.lastAccessAt)}，创建序号 #${c.creationIndex}`;
   }
 
   /**
@@ -830,12 +1216,17 @@ export class CookieJar {
       sameSite: c.sameSite,
       sameSiteDefault: c.sameSiteDefault,
       sameSiteLabel: sameSiteLabel(c.sameSite, c.sameSiteDefault),
+      priority: c.priority,
+      priorityDefault: c.priorityDefault,
+      priorityLabel: priorityLabel(c.priority, c.priorityDefault),
+      bucket: registrableDomain(c.domain),
       persistent: c.expiresAt !== undefined,
       expiresAt: c.expiresAt === undefined ? null : formatTime(c.expiresAt),
       remaining: c.expiresAt === undefined ? null : expired ? '已过期' : formatRemaining(c.expiresAt, now),
       expired,
       createdAt: formatTime(c.createdAt),
       updatedAt: formatTime(c.updatedAt),
+      lastAccessAt: formatTime(c.lastAccessAt),
     };
   }
 
@@ -860,6 +1251,7 @@ export class CookieJar {
       notices,
       cookie: stored ? this.toView(stored, Date.now()) : null,
       jar: this.views(Date.now()),
+      eviction: null,
     };
   }
 }
